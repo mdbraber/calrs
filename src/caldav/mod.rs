@@ -463,7 +463,8 @@ impl CaldavClient {
     ) -> Result<SyncResult> {
         let url = self.resolve_url(calendar_href);
 
-        let token_value = sync_token.unwrap_or("");
+        // Tokens are stored decoded (see `xml_text`), so escape them again.
+        let token_value = xml_escape(sync_token.unwrap_or(""));
         let body = format!(
             r#"<?xml version="1.0" encoding="utf-8"?>
 <d:sync-collection xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
@@ -858,7 +859,7 @@ fn extract_tag_exact(xml: &str, tag: &str) -> Option<String> {
         } else {
             start + open.len() + after_open.find('>')? + 1
         };
-        if let Some(end) = xml[content_start..].find(&close) {
+        if let Some(end) = find_close_tag(&xml[content_start..], &close) {
             let value = xml_text(&xml[content_start..content_start + end])
                 .trim()
                 .to_string();
@@ -868,6 +869,30 @@ fn extract_tag_exact(xml: &str, tag: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Position of `close` in `content`, ignoring matches inside CDATA sections
+/// (a CDATA display name may itself contain `</d:displayname>`).
+fn find_close_tag(content: &str, close: &str) -> Option<usize> {
+    let mut pos = 0;
+    loop {
+        let rest = &content[pos..];
+        let close_at = rest.find(close)?;
+        match rest.find("<![CDATA[") {
+            Some(cdata_at) if cdata_at < close_at => {
+                let cdata_end = rest[cdata_at..].find("]]>")?;
+                pos += cdata_at + cdata_end + 3;
+            }
+            _ => return Some(pos + close_at),
+        }
+    }
+}
+
+/// Escape text for use as XML element content.
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Turn the raw content of an element into its text value: unwrap CDATA
@@ -900,6 +925,8 @@ fn xml_text(raw: &str) -> String {
     }
 }
 
+/// Decode the predefined XML entities and numeric character references,
+/// leaving unknown or malformed references as they are.
 fn decode_entities(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -1074,6 +1101,23 @@ mod tests {
         );
         let xml = "<d:displayname><![CDATA[]]></d:displayname>";
         assert_eq!(extract_tag(xml, "d:displayname"), None);
+        // A closing tag inside CDATA doesn't end the element
+        let xml = "<d:displayname><![CDATA[a</d:displayname>b]]></d:displayname>";
+        assert_eq!(
+            extract_tag(xml, "d:displayname"),
+            Some("a</d:displayname>b".to_string())
+        );
+    }
+
+    #[test]
+    fn sync_token_roundtrips_through_xml() {
+        let xml = "<d:sync-token>https://example.com/sync?a=1&amp;b=&lt;2&gt;</d:sync-token>";
+        let token = extract_tag(xml, "d:sync-token").unwrap();
+        assert_eq!(token, "https://example.com/sync?a=1&b=<2>");
+        assert_eq!(
+            xml_escape(&token),
+            "https://example.com/sync?a=1&amp;b=&lt;2&gt;"
+        );
     }
 
     #[test]
